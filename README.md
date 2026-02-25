@@ -567,6 +567,9 @@ Cada etapa construye sobre la anterior, agregando capacidades sin desechar lo ap
 **Nicolás Díaz**  
 Proyecto Módulo 2 - Bases de Datos y Cloud Computing  
 Fecha: Febrero 2026
+contacto: 
+   email: nicolasdiiaz0@gmail.com
+   telefono: +543512118820
 
 
 ---
