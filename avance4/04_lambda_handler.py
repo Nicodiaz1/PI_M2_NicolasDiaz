@@ -5,12 +5,43 @@ FleetLogix - Funciones Lambda para AWS
 
 import json
 import boto3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 # Clientes AWS
 dynamodb = boto3.resource('dynamodb')
 sns = boto3.client('sns')
+
+# =====================================================
+# HELPER FUNCTIONS
+# =====================================================
+
+def convert_floats(obj):
+    """
+    Convierte recursivamente floats a Decimal para DynamoDB.
+    DynamoDB no acepta floats nativos de Python.
+    """
+    if isinstance(obj, float):
+        return Decimal(str(obj))
+    elif isinstance(obj, dict):
+        return {k: convert_floats(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_floats(i) for i in obj]
+    return obj
+
+def parse_event_body(event):
+    """
+    Parsea el body del event que viene desde API Gateway.
+    API Gateway envía body como string JSON en proxy integration.
+    """
+    # Si viene desde API Gateway con proxy integration
+    if 'body' in event:
+        body = event['body']
+        if isinstance(body, str):
+            return json.loads(body)
+        return body
+    # Si viene directo (test manual)
+    return event
 
 # =====================================================
 # LAMBDA 1: Verificar si una entrega se completó
@@ -20,14 +51,17 @@ def lambda_verificar_entrega(event, context):
     Verifica si una entrega se completó comparando con DynamoDB
     """
     
+    # Parsear body desde API Gateway
+    body = parse_event_body(event)
+    
     # Obtener datos del evento
-    delivery_id = event.get('delivery_id')
-    tracking_number = event.get('tracking_number')
+    delivery_id = body.get('delivery_id')
+    tracking_number = body.get('tracking_number')
     
     if not delivery_id:
         return {
             'statusCode': 400,
-            'body': json.dumps({'error': 'delivery_id es requerido'})
+            'body': json.dumps({'error': 'delivery_id es requerido'}, default=str)
         }
     
     # Conectar a tabla DynamoDB
@@ -51,7 +85,7 @@ def lambda_verificar_entrega(event, context):
                     'is_completed': is_completed,
                     'status': item.get('status'),
                     'delivered_datetime': str(item.get('delivered_datetime', ''))
-                })
+                }, default=str)
             }
         else:
             return {
@@ -59,7 +93,7 @@ def lambda_verificar_entrega(event, context):
                 'body': json.dumps({
                     'error': 'Entrega no encontrada',
                     'delivery_id': delivery_id
-                })
+                }, default=str)
             }
             
     except Exception as e:
@@ -67,7 +101,7 @@ def lambda_verificar_entrega(event, context):
             'statusCode': 500,
             'body': json.dumps({
                 'error': str(e)
-            })
+            }, default=str)
         }
 
 # =====================================================
@@ -78,16 +112,19 @@ def lambda_calcular_eta(event, context):
     Calcula ETA basado en ubicación actual y destino
     """
     
+    # Parsear body desde API Gateway
+    body = parse_event_body(event)
+    
     # Obtener datos del evento
-    vehicle_id = event.get('vehicle_id')
-    current_location = event.get('current_location')  # {lat, lon}
-    destination = event.get('destination')  # {lat, lon}
-    current_speed_kmh = event.get('current_speed_kmh', 60)
+    vehicle_id = body.get('vehicle_id')
+    current_location = body.get('current_location')  # {lat, lon}
+    destination = body.get('destination')  # {lat, lon}
+    current_speed_kmh = body.get('current_speed_kmh', 60)
     
     if not all([vehicle_id, current_location, destination]):
         return {
             'statusCode': 400,
-            'body': json.dumps({'error': 'Faltan parámetros requeridos'})
+            'body': json.dumps({'error': 'Faltan parámetros requeridos'}, default=str)
         }
     
     try:
@@ -101,23 +138,22 @@ def lambda_calcular_eta(event, context):
         # Calcular tiempo
         if current_speed_kmh > 0:
             hours = distance_km / current_speed_kmh
-            eta = datetime.now() + timedelta(hours=hours)
+            eta = datetime.now(timezone.utc) + timedelta(hours=hours)
         else:
             eta = None
         
-        # Guardar en DynamoDB
+        # Guardar en DynamoDB (convertir floats a Decimal)
         table = dynamodb.Table('vehicle_tracking')
-        table.put_item(
-            Item={
-                'vehicle_id': vehicle_id,
-                'timestamp': datetime.now().isoformat(),
-                'current_location': current_location,
-                'destination': destination,
-                'distance_remaining_km': Decimal(str(round(distance_km, 2))),
-                'eta': eta.isoformat() if eta else None,
-                'current_speed_kmh': Decimal(str(current_speed_kmh))
-            }
-        )
+        item = {
+            'vehicle_id': vehicle_id,
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'current_location': current_location,
+            'destination': destination,
+            'distance_remaining_km': round(distance_km, 2),
+            'eta': eta.isoformat() if eta else None,
+            'current_speed_kmh': current_speed_kmh
+        }
+        table.put_item(Item=convert_floats(item))
         
         return {
             'statusCode': 200,
@@ -126,7 +162,7 @@ def lambda_calcular_eta(event, context):
                 'distance_remaining_km': round(distance_km, 2),
                 'eta': eta.isoformat() if eta else 'No disponible',
                 'estimated_minutes': round(hours * 60) if eta else None
-            })
+            }, default=str)
         }
         
     except Exception as e:
@@ -134,7 +170,7 @@ def lambda_calcular_eta(event, context):
             'statusCode': 500,
             'body': json.dumps({
                 'error': str(e)
-            })
+            }, default=str)
         }
 
 # =====================================================
@@ -145,16 +181,19 @@ def lambda_alerta_desvio(event, context):
     Detecta desvíos de ruta y envía alertas
     """
     
+    # Parsear body desde API Gateway
+    body = parse_event_body(event)
+    
     # Obtener datos del evento
-    vehicle_id = event.get('vehicle_id')
-    current_location = event.get('current_location')  # {lat, lon}
-    route_id = event.get('route_id')
-    driver_id = event.get('driver_id')
+    vehicle_id = body.get('vehicle_id')
+    current_location = body.get('current_location')  # {lat, lon}
+    route_id = body.get('route_id')
+    driver_id = body.get('driver_id')
     
     if not all([vehicle_id, current_location, route_id]):
         return {
             'statusCode': 400,
-            'body': json.dumps({'error': 'Faltan parámetros requeridos'})
+            'body': json.dumps({'error': 'Faltan parámetros requeridos'}, default=str)
         }
     
     try:
@@ -167,7 +206,7 @@ def lambda_alerta_desvio(event, context):
         if 'Item' not in response:
             return {
                 'statusCode': 404,
-                'body': json.dumps({'error': 'Ruta no encontrada'})
+                'body': json.dumps({'error': 'Ruta no encontrada'}, default=str)
             }
         
         waypoints = response['Item'].get('waypoints', [])
@@ -185,19 +224,18 @@ def lambda_alerta_desvio(event, context):
         is_deviated = min_distance > DEVIATION_THRESHOLD_KM
         
         if is_deviated:
-            # Guardar alerta en DynamoDB
+            # Guardar alerta en DynamoDB (convertir floats a Decimal)
             alerts_table = dynamodb.Table('alerts_history')
-            alerts_table.put_item(
-                Item={
-                    'vehicle_id': vehicle_id,
-                    'timestamp': datetime.now().isoformat(),
-                    'driver_id': driver_id,
-                    'route_id': route_id,
-                    'deviation_km': Decimal(str(round(min_distance, 2))),
-                    'current_location': current_location,
-                    'alert_type': 'ROUTE_DEVIATION'
-                }
-            )
+            alert_item = {
+                'vehicle_id': vehicle_id,
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'driver_id': driver_id,
+                'route_id': route_id,
+                'deviation_km': round(min_distance, 2),
+                'current_location': current_location,
+                'alert_type': 'ROUTE_DEVIATION'
+            }
+            alerts_table.put_item(Item=convert_floats(alert_item))
         
         return {
             'statusCode': 200,
@@ -207,7 +245,7 @@ def lambda_alerta_desvio(event, context):
                 'deviation_km': round(min_distance, 2),
                 'alert_sent': is_deviated,
                 'threshold_km': DEVIATION_THRESHOLD_KM
-            })
+            }, default=str)
         }
         
     except Exception as e:
@@ -215,5 +253,5 @@ def lambda_alerta_desvio(event, context):
             'statusCode': 500,
             'body': json.dumps({
                 'error': str(e)
-            })
+            }, default=str)
         }
